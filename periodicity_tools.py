@@ -10,6 +10,11 @@ MAX_FREQ = 1/3
 NYQUST_FACTOR = 5
 
 
+def get_min_frequency(timespan):
+    """Minimum frequency to search, set to 2 full cycles over the timespan of the data"""
+    return 5/2 / timespan
+
+
 def get_decline_detections(name, epoch_after_peak=None):
     points = get_lightcurve_from_file(name)
     if not points:
@@ -103,6 +108,7 @@ def _prepare_baseline(days, mags, errors, poly_deg):
     return {
         "days": days,
         "mags": mags,
+        "resids": resids,
         "errors": errors,
         "normalized_errors": errors_rescaled,
         "t_mean": t_mean,
@@ -138,7 +144,7 @@ def compute_delta_chi2_curve(days, mags, errors,
     mags = base["mags"]
     errors = base["normalized_errors"]
 
-    f_min = 5/2 / T
+    f_min = get_min_frequency(T)
     f_max = max_freq
     delta_f = 1 / (nyquist_factor * T)
 
@@ -172,7 +178,7 @@ def analyze_candidate(name, days, mags, errors,
                       nyquist_factor=NYQUST_FACTOR):
 
     base = _prepare_baseline(days, mags, errors, poly_deg)
-
+    errors = base["normalized_errors"]
     frequencies, delta_chi2_vals = compute_delta_chi2_curve(
         days, mags, errors,
         poly_deg,
@@ -184,6 +190,16 @@ def analyze_candidate(name, days, mags, errors,
     best_idx = np.argmax(delta_chi2_vals)
     best_frequency = frequencies[best_idx]
     best_delta_chi2 = delta_chi2_vals[best_idx]
+
+    # confidence interval in frequency space
+    _, f_lo, f_hi, _ = find_peak_ci_from_dchi2(
+        frequencies,
+        delta_chi2_vals,
+        conf=0.68,
+        df=2
+    )
+    p_lo = 1 / f_hi if np.isfinite(f_hi) else np.nan
+    p_hi = 1 / f_lo if np.isfinite(f_lo) else np.nan
 
     p_value = 1 - chi2.cdf(best_delta_chi2, df=2)
 
@@ -241,6 +257,8 @@ def analyze_candidate(name, days, mags, errors,
         "name": name,
         "best_frequency": best_frequency,
         "best_period": 1 / best_frequency,
+        "period_lo": p_lo,
+        "period_hi": p_hi,
         "best_amplitude": amplitude,
         "mda": base["mda"],
         "delta_chi2": best_delta_chi2,
@@ -248,6 +266,7 @@ def analyze_candidate(name, days, mags, errors,
         "p_value_single_freq": p_value,
         "poly_degree": poly_deg,
         "time_baseline": T,
+        "resids": base["resids"],
         "poly_model": poly_model,
         "full_model": full_model,
         "poly_coeffs": poly_coeffs,
@@ -255,3 +274,53 @@ def analyze_candidate(name, days, mags, errors,
     }
 
     return result
+
+
+def find_peak_ci_from_dchi2(freq, dchi2, conf=0.68, df=2):
+    """
+    Finds the confidence interval around the strongest peak
+    in Delta chi2 as a function of frequency.
+
+    Returns:
+        f_peak, f_lo, f_hi, level
+    """
+    freq = np.asarray(freq)
+    dchi2 = np.asarray(dchi2)
+
+    order = np.argsort(freq)
+    freq = freq[order]
+    dchi2 = dchi2[order]
+
+    i_peak = np.nanargmax(dchi2)
+
+    f_peak = freq[i_peak]
+    peak_val = dchi2[i_peak]
+
+    delta = chi2.ppf(conf, df=df)
+    level = peak_val - delta
+
+    # left intersection
+    f_lo = np.nan
+    for i in range(i_peak - 1, -1, -1):
+        if dchi2[i] <= level <= dchi2[i + 1]:
+
+            f_lo = np.interp(
+                level,
+                [dchi2[i], dchi2[i + 1]],
+                [freq[i], freq[i + 1]]
+            )
+            break
+
+    # right intersection
+    f_hi = np.nan
+    for i in range(i_peak, len(freq) - 1):
+        if dchi2[i] >= level >= dchi2[i + 1]:
+
+            f_hi = np.interp(
+                level,
+                [dchi2[i], dchi2[i + 1]],
+                [freq[i], freq[i + 1]]
+            )
+            break
+
+    return f_peak, f_lo, f_hi, level
