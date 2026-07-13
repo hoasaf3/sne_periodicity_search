@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 from numpy.linalg import lstsq
 from scipy.stats import chi2
@@ -8,6 +11,10 @@ MAX_GAP_JD = 50  # max allowed gap between detections, after which everything el
 
 MAX_FREQ = 1/3
 NYQUST_FACTOR = 5
+
+ZTF_FP_LIGHTCURVE_DIR = Path("ztf_fp_lightcurves")
+ZTF_FP_FILTER_TO_FID = {"ZTF_g": 1, "ZTF_r": 2, "ZTF_i": 3}
+MAG_ERROR_FACTOR = 2.5 / np.log(10)
 
 
 def get_min_frequency(timespan):
@@ -54,6 +61,159 @@ def get_decline_detections(name, epoch_after_peak=None):
         decline_detections = [p for p in decline_detections if p['jd'] <= max_jd]
     
     return decline_detections
+
+
+def _cut_to_decline(detections, name=None, epoch_after_peak=None):
+    if not detections:
+        return []
+
+    detections = sorted(detections, key=lambda x: x["jd"])
+
+    # ad-hoc to skip 2022xxf first peak (it shows 2 peaks)
+    if name == "2022xxf":
+        detections = [point for point in detections if point["jd"] - detections[0]["jd"] >= 40]
+
+    # ad-hoc to skip 2019vsi first peak (it shows 2 peaks)
+    if name == "2019vsi":
+        detections = [point for point in detections if point["jd"] - detections[0]["jd"] >= 40]
+
+    if not detections:
+        return []
+
+    min_mag_idx = np.argmin([p["magpsf"] for p in detections])
+    decline_detections = detections[min_mag_idx:]
+
+    for i in range(1, len(decline_detections)):
+        previous_jd = decline_detections[i - 1]["jd"]
+        current_jd = decline_detections[i]["jd"]
+
+        if current_jd - previous_jd > MAX_GAP_JD:
+            decline_detections = decline_detections[:i]
+            break
+
+    if epoch_after_peak:
+        max_jd = decline_detections[0]["jd"] + epoch_after_peak
+        decline_detections = [p for p in decline_detections if p["jd"] <= max_jd]
+
+    return decline_detections
+
+
+def _bin_detections_per_day(detections):
+    """Bin detections by UT day and filter, preserving Lasair-like fields."""
+    if not detections:
+        return []
+
+    groups = {}
+    for point in detections:
+        # JD changes at noon; JD - 0.5 is aligned with MJD/UT calendar days.
+        day = int(np.floor(point["jd"] - 0.5))
+        key = (day, point["fid"])
+        groups.setdefault(key, []).append(point)
+
+    binned = []
+    for (day, fid), points in sorted(groups.items()):
+        mags = np.array([p["magpsf"] for p in points], dtype=float)
+        errs = np.array([p["sigmapsf"] for p in points], dtype=float)
+        jds = np.array([p["jd"] for p in points], dtype=float)
+        snrs = np.array([p.get("forcediffimsnr", np.nan) for p in points], dtype=float)
+
+        template = points[0].copy()
+        template.update(
+            {
+                "candid": day * 10 + fid,
+                "jd": float(np.mean(jds)),
+                "jd_min": float(np.min(jds)),
+                "jd_max": float(np.max(jds)),
+                "magpsf": float(np.mean(mags)),
+                "sigmapsf": float(np.sqrt(np.sum(errs**2)) / len(errs)),
+                "forcediffimsnr": float(np.nanmean(snrs)),
+                "n_binned": len(points),
+                "source": "ZTF forced photometry converted to Lasair-like daily-binned detection",
+            }
+        )
+        binned.append(template)
+
+    return binned
+
+
+def get_decline_detections_fp(
+    name,
+    epoch_after_peak=None,
+    detection_snr=5.0,
+    bin_daily=False,
+    lightcurve_dir=ZTF_FP_LIGHTCURVE_DIR,
+):
+    """Return ZTF forced-photometry decline detections in Lasair-like format.
+
+    The FP JSONs store forced difference fluxes for every epoch. This function
+    keeps positive, significant forced-flux measurements and converts them to
+    the ``magpsf``/``sigmapsf`` fields used by the existing pipeline.
+
+    If ``bin_daily`` is True, detections are grouped by UT day and filter. The
+    binned point uses the average magnitude and the quadrature error of the
+    mean: sqrt(sum(err_i^2)) / N.
+    """
+    filepath = Path(lightcurve_dir) / f"{name}.json"
+    if not filepath.exists():
+        return []
+
+    payload = json.loads(filepath.read_text())
+    rows = payload.get("lightcurve", [])
+    detections = []
+
+    for i, row in enumerate(rows):
+        filt = row.get("filter")
+        fid = ZTF_FP_FILTER_TO_FID.get(filt)
+        if fid is None:
+            continue
+
+        flux = row.get("forcediffimflux")
+        flux_unc = row.get("forcediffimfluxunc")
+        zpdiff = row.get("zpdiff")
+        jd = row.get("jd")
+        snr = row.get("forcediffimsnr")
+
+        if flux is None or flux_unc is None or zpdiff is None or jd is None:
+            continue
+
+        flux = float(flux)
+        flux_unc = float(flux_unc)
+        zpdiff = float(zpdiff)
+        jd = float(jd)
+        snr = float(snr) if snr is not None else flux / flux_unc if flux_unc > 0 else np.nan
+
+        if flux <= 0 or flux_unc <= 0 or not np.isfinite(snr) or snr < detection_snr:
+            continue
+
+        mag = zpdiff - 2.5 * np.log10(flux)
+        magerr = MAG_ERROR_FACTOR * flux_unc / flux
+        if not np.isfinite(mag) or not np.isfinite(magerr):
+            continue
+
+        point = {
+            "candid": int(row.get("pid") or 0) * 10_000 + i,
+            "jd": jd,
+            "fid": fid,
+            "filter": filt,
+            "magpsf": float(mag),
+            "sigmapsf": float(magerr),
+            "ra": payload.get("ra"),
+            "dec": payload.get("dec"),
+            "forcediffimflux": flux,
+            "forcediffimfluxunc": flux_unc,
+            "forcediffimsnr": snr,
+            "zpdiff": zpdiff,
+            "diffmaglim": row.get("diffmaglim"),
+            "procstatus": row.get("procstatus"),
+            "diffimgstatus": row.get("diffimgstatus"),
+            "source": "ZTF forced photometry converted to Lasair-like detection",
+        }
+        detections.append(point)
+
+    if bin_daily:
+        detections = _bin_detections_per_day(detections)
+
+    return _cut_to_decline(detections, name=name, epoch_after_peak=epoch_after_peak)
 
 
 def _prepare_baseline(days, mags, errors, poly_deg):
