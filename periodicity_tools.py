@@ -216,13 +216,17 @@ def get_decline_detections_fp(
     return _cut_to_decline(detections, name=name, epoch_after_peak=epoch_after_peak)
 
 
-def _prepare_baseline(days, mags, errors, poly_deg):
+def _prepare_baseline(days, mags, errors, poly_deg, systematic_error=0.0):
     """
     Fit a polynomial baseline and prepare all necessary vairables for the frequency search
     """
     days = np.asarray(days)
     mags = np.asarray(mags)
-    errors = np.asarray(errors)
+    input_errors = np.asarray(errors)
+    if systematic_error:
+        errors = np.sqrt(input_errors**2 + systematic_error**2)
+    else:
+        errors = input_errors.copy()
 
     t_mean = np.mean(days)
     t_centered = days - t_mean
@@ -250,8 +254,10 @@ def _prepare_baseline(days, mags, errors, poly_deg):
     N = len(mags)
     k = poly_deg + 1
     dof = N - k
-    chi2_red = chi2_poly / dof
-    scale_factor = max(1.0, np.sqrt(chi2_red))
+    chi2_poly_initial = chi2_poly
+    chi2_red_initial = chi2_poly_initial / dof
+    scale_factor_raw = np.sqrt(chi2_red_initial)
+    scale_factor = max(1.0, scale_factor_raw)
     errors_rescaled = errors * scale_factor
     w = 1.0 / errors_rescaled
     tw_matrix = t_matrix * w[:, None]
@@ -261,6 +267,7 @@ def _prepare_baseline(days, mags, errors, poly_deg):
     model_poly_vals = t_matrix @ poly_coeffs
     resids = mags - model_poly_vals
     chi2_poly = np.sum((resids / errors_rescaled) ** 2)
+    chi2_red = chi2_poly / dof
 
     # Minimal Detectable Amplitude
     mda = np.std(resids) / np.sqrt(len(resids))
@@ -268,15 +275,23 @@ def _prepare_baseline(days, mags, errors, poly_deg):
     return {
         "days": days,
         "mags": mags,
+        "input_errors": input_errors,
         "resids": resids,
         "errors": errors,
         "normalized_errors": errors_rescaled,
+        "systematic_error": systematic_error,
         "t_mean": t_mean,
         "t_centered": t_centered,
         "t_scaled": t_scaled,
         "T": T,
         "poly_coeffs": poly_coeffs,
+        "chi2_poly_initial": chi2_poly_initial,
+        "chi2_red_initial": chi2_red_initial,
         "chi2_poly": chi2_poly,
+        "chi2_red": chi2_red,
+        "dof": dof,
+        "scale_factor_raw": scale_factor_raw,
+        "scale_factor": scale_factor,
         "mda": mda,
         "w": w,
         "yw": yw
@@ -286,14 +301,15 @@ def _prepare_baseline(days, mags, errors, poly_deg):
 def compute_delta_chi2_curve(days, mags, errors,
                              poly_deg,
                              max_freq=MAX_FREQ,
-                             nyquist_factor=NYQUST_FACTOR):
+                             nyquist_factor=NYQUST_FACTOR,
+                             systematic_error=0.0):
     """
     Calcualte the improvement in chi2 between baseline polynomial model and poly+sinusoid model.
     delta chi2 is chi2_poly - chi2_full, so bigger chi2 means better fit for full model.
     Returns (freq, delta_chi2_vals)
     """
 
-    base = _prepare_baseline(days, mags, errors, poly_deg)
+    base = _prepare_baseline(days, mags, errors, poly_deg, systematic_error=systematic_error)
 
     T = base["T"]
     t_centered = base["t_centered"]
@@ -335,15 +351,17 @@ def compute_delta_chi2_curve(days, mags, errors,
 def analyze_candidate(name, days, mags, errors,
                       poly_deg=3,
                       max_freq=MAX_FREQ,
-                      nyquist_factor=NYQUST_FACTOR):
+                      nyquist_factor=NYQUST_FACTOR,
+                      systematic_error=0.0):
 
-    base = _prepare_baseline(days, mags, errors, poly_deg)
+    base = _prepare_baseline(days, mags, errors, poly_deg, systematic_error=systematic_error)
     errors = base["normalized_errors"]
     frequencies, delta_chi2_vals = compute_delta_chi2_curve(
         days, mags, errors,
         poly_deg,
         max_freq,
-        nyquist_factor
+        nyquist_factor,
+        systematic_error=0.0
     )
 
     # Find best freq (max delta chi2 , biggest improvement)
@@ -423,6 +441,13 @@ def analyze_candidate(name, days, mags, errors,
         "mda": base["mda"],
         "delta_chi2": best_delta_chi2,
         "chi2_poly": base["chi2_poly"],
+        "chi2_red_initial": base["chi2_red_initial"],
+        "chi2_poly_initial": base["chi2_poly_initial"],
+        "chi2_red": base["chi2_red"],
+        "scale_factor_raw": base["scale_factor_raw"],
+        "scale_factor": base["scale_factor"],
+        "systematic_error": base["systematic_error"],
+        "dof": base["dof"],
         "p_value_single_freq": p_value,
         "poly_degree": poly_deg,
         "time_baseline": T,

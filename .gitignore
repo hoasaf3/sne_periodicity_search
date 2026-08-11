@@ -3,3 +3,5 @@ appendix_fits/
 data/
 Figures/
 lasair_lightcurves/
+.ztf_fp_credentials
+ztf_fp_requests/
