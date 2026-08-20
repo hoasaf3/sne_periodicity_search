@@ -1,0 +1,511 @@
+import json
+from pathlib import Path
+
+import numpy as np
+from numpy.linalg import lstsq
+from scipy.stats import chi2
+
+from lasair_tools import get_lightcurve_from_file
+
+MAX_GAP_JD = 50  # max allowed gap between detections, after which everything else is dropped
+
+MAX_FREQ = 1/3
+NYQUST_FACTOR = 5
+
+ZTF_FP_LIGHTCURVE_DIR = Path("ztf_fp_lightcurves")
+ZTF_FP_FILTER_TO_FID = {"ZTF_g": 1, "ZTF_r": 2, "ZTF_i": 3}
+MAG_ERROR_FACTOR = 2.5 / np.log(10)
+
+
+def get_min_frequency(timespan):
+    """Minimum frequency to search, set to 2 full cycles over the timespan of the data"""
+    return 5/2 / timespan
+
+
+def get_decline_detections(name, epoch_after_peak=None):
+    points = get_lightcurve_from_file(name)
+    if not points:
+        return []
+
+    detections = [point for point in points if 'candid' in point]
+    # detections.sort(key=lambda x: x['jd'])
+
+    if not detections:
+        return []
+
+    # ad-hoc to skip 2022xxf first peak (it shows 2 peaks)
+    if name == '2022xxf':
+        detections = [point for point in detections if point['jd'] - detections[0]['jd'] >= 40]
+
+    # ad-hoc to skip 2019vsi first peak (it shows 2 peaks)
+    if name == '2019vsi':
+        detections = [point for point in detections if point['jd'] - detections[0]['jd'] >= 40]
+
+
+    # Find peak
+    min_mag_idx = np.argmin([p['magpsf'] for p in detections])
+    decline_detections = detections[min_mag_idx:]
+    
+    # Find gaps > 100 days and cut off the tail
+    for i in range(1, len(decline_detections)):
+        previous_jd = decline_detections[i-1]['jd']
+        current_jd = decline_detections[i]['jd']
+        
+        if current_jd - previous_jd > MAX_GAP_JD:
+            # Gap found
+            decline_detections = decline_detections[:i]
+            break
+            
+    if epoch_after_peak:
+        max_jd = decline_detections[0]['jd'] + epoch_after_peak
+        decline_detections = [p for p in decline_detections if p['jd'] <= max_jd]
+    
+    return decline_detections
+
+
+def _cut_to_decline(detections, name=None, epoch_after_peak=None):
+    if not detections:
+        return []
+
+    detections = sorted(detections, key=lambda x: x["jd"])
+
+    # ad-hoc to skip 2022xxf first peak (it shows 2 peaks)
+    if name == "2022xxf":
+        detections = [point for point in detections if point["jd"] - detections[0]["jd"] >= 40]
+
+    # ad-hoc to skip 2019vsi first peak (it shows 2 peaks)
+    if name == "2019vsi":
+        detections = [point for point in detections if point["jd"] - detections[0]["jd"] >= 40]
+
+    if not detections:
+        return []
+
+    min_mag_idx = np.argmin([p["magpsf"] for p in detections])
+    decline_detections = detections[min_mag_idx:]
+
+    for i in range(1, len(decline_detections)):
+        previous_jd = decline_detections[i - 1]["jd"]
+        current_jd = decline_detections[i]["jd"]
+
+        if current_jd - previous_jd > MAX_GAP_JD:
+            decline_detections = decline_detections[:i]
+            break
+
+    if epoch_after_peak:
+        max_jd = decline_detections[0]["jd"] + epoch_after_peak
+        decline_detections = [p for p in decline_detections if p["jd"] <= max_jd]
+
+    return decline_detections
+
+
+def _bin_detections_per_day(detections):
+    """Bin detections by UT day and filter, preserving Lasair-like fields."""
+    if not detections:
+        return []
+
+    groups = {}
+    for point in detections:
+        # JD changes at noon; JD - 0.5 is aligned with MJD/UT calendar days.
+        day = int(np.floor(point["jd"] - 0.5))
+        key = (day, point["fid"])
+        groups.setdefault(key, []).append(point)
+
+    binned = []
+    for (day, fid), points in sorted(groups.items()):
+        mags = np.array([p["magpsf"] for p in points], dtype=float)
+        errs = np.array([p["sigmapsf"] for p in points], dtype=float)
+        jds = np.array([p["jd"] for p in points], dtype=float)
+        snrs = np.array([p.get("forcediffimsnr", np.nan) for p in points], dtype=float)
+
+        template = points[0].copy()
+        template.update(
+            {
+                "candid": day * 10 + fid,
+                "jd": float(np.mean(jds)),
+                "jd_min": float(np.min(jds)),
+                "jd_max": float(np.max(jds)),
+                "magpsf": float(np.mean(mags)),
+                "sigmapsf": float(np.sqrt(np.sum(errs**2)) / len(errs)),
+                "forcediffimsnr": float(np.nanmean(snrs)),
+                "n_binned": len(points),
+                "source": "ZTF forced photometry converted to Lasair-like daily-binned detection",
+            }
+        )
+        binned.append(template)
+
+    return binned
+
+
+def get_decline_detections_fp(
+    name,
+    epoch_after_peak=None,
+    detection_snr=5.0,
+    bin_daily=False,
+    lightcurve_dir=ZTF_FP_LIGHTCURVE_DIR,
+):
+    """Return ZTF forced-photometry decline detections in Lasair-like format.
+
+    The FP JSONs store forced difference fluxes for every epoch. This function
+    keeps positive, significant forced-flux measurements and converts them to
+    the ``magpsf``/``sigmapsf`` fields used by the existing pipeline.
+
+    If ``bin_daily`` is True, detections are grouped by UT day and filter. The
+    binned point uses the average magnitude and the quadrature error of the
+    mean: sqrt(sum(err_i^2)) / N.
+    """
+    filepath = Path(lightcurve_dir) / f"{name}.json"
+    if not filepath.exists():
+        return []
+
+    payload = json.loads(filepath.read_text())
+    rows = payload.get("lightcurve", [])
+    detections = []
+
+    for i, row in enumerate(rows):
+        filt = row.get("filter")
+        fid = ZTF_FP_FILTER_TO_FID.get(filt)
+        if fid is None:
+            continue
+
+        flux = row.get("forcediffimflux")
+        flux_unc = row.get("forcediffimfluxunc")
+        zpdiff = row.get("zpdiff")
+        jd = row.get("jd")
+        snr = row.get("forcediffimsnr")
+
+        if flux is None or flux_unc is None or zpdiff is None or jd is None:
+            continue
+
+        flux = float(flux)
+        flux_unc = float(flux_unc)
+        zpdiff = float(zpdiff)
+        jd = float(jd)
+        snr = float(snr) if snr is not None else flux / flux_unc if flux_unc > 0 else np.nan
+
+        if flux <= 0 or flux_unc <= 0 or not np.isfinite(snr) or snr < detection_snr:
+            continue
+
+        mag = zpdiff - 2.5 * np.log10(flux)
+        magerr = MAG_ERROR_FACTOR * flux_unc / flux
+        if not np.isfinite(mag) or not np.isfinite(magerr):
+            continue
+
+        point = {
+            "candid": int(row.get("pid") or 0) * 10_000 + i,
+            "jd": jd,
+            "fid": fid,
+            "filter": filt,
+            "magpsf": float(mag),
+            "sigmapsf": float(magerr),
+            "ra": payload.get("ra"),
+            "dec": payload.get("dec"),
+            "forcediffimflux": flux,
+            "forcediffimfluxunc": flux_unc,
+            "forcediffimsnr": snr,
+            "zpdiff": zpdiff,
+            "diffmaglim": row.get("diffmaglim"),
+            "procstatus": row.get("procstatus"),
+            "diffimgstatus": row.get("diffimgstatus"),
+            "source": "ZTF forced photometry converted to Lasair-like detection",
+        }
+        detections.append(point)
+
+    if bin_daily:
+        detections = _bin_detections_per_day(detections)
+
+    return _cut_to_decline(detections, name=name, epoch_after_peak=epoch_after_peak)
+
+
+def _prepare_baseline(days, mags, errors, poly_deg, systematic_error=0.0):
+    """
+    Fit a polynomial baseline and prepare all necessary vairables for the frequency search
+    """
+    days = np.asarray(days)
+    mags = np.asarray(mags)
+    input_errors = np.asarray(errors)
+    if systematic_error:
+        errors = np.sqrt(input_errors**2 + systematic_error**2)
+    else:
+        errors = input_errors.copy()
+
+    t_mean = np.mean(days)
+    t_centered = days - t_mean
+
+    T = days.max() - days.min()
+    t_scaled = 2 * t_centered / T
+    
+    # poly_deg+1 columns of t_scaled^k
+    t_matrix = np.column_stack([t_scaled**k for k in range(poly_deg + 1)])
+
+    # We minimize chi^2 = sum[(y - model)^2 / sigma^2]
+    # This is implemented by multiplying both t and y by 1/sigma
+    w = 1.0 / errors
+    tw_matrix = t_matrix * w[:, None]
+    yw = mags * w
+
+    # Find poly_coeffs s.t. tw_poly * poly_coeffs = yw
+    poly_coeffs, *_ = lstsq(tw_matrix, yw, rcond=None)
+
+    model_poly_vals = t_matrix @ poly_coeffs
+    resids = mags - model_poly_vals
+    chi2_poly = np.sum((resids / errors) ** 2)
+
+    # Normalize errors to avoid underestimating errors
+    N = len(mags)
+    k = poly_deg + 1
+    dof = N - k
+    chi2_poly_initial = chi2_poly
+    chi2_red_initial = chi2_poly_initial / dof
+    scale_factor_raw = np.sqrt(chi2_red_initial)
+    scale_factor = max(1.0, scale_factor_raw)
+    errors_rescaled = errors * scale_factor
+    w = 1.0 / errors_rescaled
+    tw_matrix = t_matrix * w[:, None]
+    yw = mags * w
+    poly_coeffs, *_ = lstsq(tw_matrix, yw, rcond=None)
+
+    model_poly_vals = t_matrix @ poly_coeffs
+    resids = mags - model_poly_vals
+    chi2_poly = np.sum((resids / errors_rescaled) ** 2)
+    chi2_red = chi2_poly / dof
+
+    # Minimal Detectable Amplitude
+    mda = np.std(resids) / np.sqrt(len(resids))
+
+    return {
+        "days": days,
+        "mags": mags,
+        "input_errors": input_errors,
+        "resids": resids,
+        "errors": errors,
+        "normalized_errors": errors_rescaled,
+        "systematic_error": systematic_error,
+        "t_mean": t_mean,
+        "t_centered": t_centered,
+        "t_scaled": t_scaled,
+        "T": T,
+        "poly_coeffs": poly_coeffs,
+        "chi2_poly_initial": chi2_poly_initial,
+        "chi2_red_initial": chi2_red_initial,
+        "chi2_poly": chi2_poly,
+        "chi2_red": chi2_red,
+        "dof": dof,
+        "scale_factor_raw": scale_factor_raw,
+        "scale_factor": scale_factor,
+        "mda": mda,
+        "w": w,
+        "yw": yw
+    }
+
+
+def compute_delta_chi2_curve(days, mags, errors,
+                             poly_deg,
+                             max_freq=MAX_FREQ,
+                             nyquist_factor=NYQUST_FACTOR,
+                             systematic_error=0.0):
+    """
+    Calcualte the improvement in chi2 between baseline polynomial model and poly+sinusoid model.
+    delta chi2 is chi2_poly - chi2_full, so bigger chi2 means better fit for full model.
+    Returns (freq, delta_chi2_vals)
+    """
+
+    base = _prepare_baseline(days, mags, errors, poly_deg, systematic_error=systematic_error)
+
+    T = base["T"]
+    t_centered = base["t_centered"]
+    t_scaled = base["t_scaled"]
+    chi2_poly = base["chi2_poly"]
+    w = base["w"]
+    yw = base["yw"]
+    mags = base["mags"]
+    errors = base["normalized_errors"]
+
+    f_min = get_min_frequency(T)
+    f_max = max_freq
+    delta_f = 1 / (nyquist_factor * T)
+
+    frequencies = np.arange(f_min, f_max, delta_f)
+    delta_chi2_vals = []
+
+    for f in frequencies:
+
+        omega = 2 * np.pi * f
+
+        t_mat_full = np.column_stack([
+            *[t_scaled**k for k in range(poly_deg + 1)],
+            np.sin(omega * t_centered),
+            np.cos(omega * t_centered)
+        ])
+
+        tw_mat_full = t_mat_full * w[:, None]
+        coeffs_full, *_ = lstsq(tw_mat_full, yw, rcond=None)
+
+        model_full_vals = t_mat_full @ coeffs_full
+        chi2_full = np.sum(((mags - model_full_vals) / errors) ** 2)
+
+        delta_chi2_vals.append(chi2_poly - chi2_full)
+
+    return frequencies, np.array(delta_chi2_vals)
+
+
+def analyze_candidate(name, days, mags, errors,
+                      poly_deg=3,
+                      max_freq=MAX_FREQ,
+                      nyquist_factor=NYQUST_FACTOR,
+                      systematic_error=0.0):
+
+    base = _prepare_baseline(days, mags, errors, poly_deg, systematic_error=systematic_error)
+    errors = base["normalized_errors"]
+    frequencies, delta_chi2_vals = compute_delta_chi2_curve(
+        days, mags, errors,
+        poly_deg,
+        max_freq,
+        nyquist_factor,
+        systematic_error=0.0
+    )
+
+    # Find best freq (max delta chi2 , biggest improvement)
+    best_idx = np.argmax(delta_chi2_vals)
+    best_frequency = frequencies[best_idx]
+    best_delta_chi2 = delta_chi2_vals[best_idx]
+
+    # confidence interval in frequency space
+    _, f_lo, f_hi, _ = find_peak_ci_from_dchi2(
+        frequencies,
+        delta_chi2_vals,
+        conf=0.68,
+        df=2
+    )
+    p_lo = 1 / f_hi if np.isfinite(f_hi) else np.nan
+    p_hi = 1 / f_lo if np.isfinite(f_lo) else np.nan
+
+    p_value = 1 - chi2.cdf(best_delta_chi2, df=2)
+
+    omega_best = 2 * np.pi * best_frequency
+
+    t_mean = base["t_mean"]
+    t_centered = base["t_centered"]
+    t_scaled = base["t_scaled"]
+    T = base["T"]
+    w = base["w"]
+    yw = base["yw"]
+    mags = base["mags"]
+    errors = base["errors"]
+    poly_coeffs = base["poly_coeffs"]
+
+    # Find the coeffs of the best fit
+    # This is done again, even though it was already done for this specific frequency during the wide search,
+    # because now we need to store the reuslting coeffs (A, B). Since lstsq is deterministic, it's ok.
+    # The alternataive is to store A,B for every trial frequency.
+    t_mat_best = np.column_stack([
+        *[t_scaled**k for k in range(poly_deg + 1)],
+        np.sin(omega_best * t_centered),
+        np.cos(omega_best * t_centered)
+    ])
+
+    tw_mat_best = t_mat_best * w[:, None]
+    coeffs_full_best_freq, *_ = lstsq(tw_mat_best, yw, rcond=None)
+
+    A = coeffs_full_best_freq[-2]
+    B = coeffs_full_best_freq[-1]
+    amplitude = np.sqrt(A**2 + B**2)
+
+    # Define callable models for easy plotting later
+    def poly_model(t_eval):
+        t_eval = np.asarray(t_eval)
+        t_c = t_eval - t_mean
+        t_s = 2 * t_c / T
+        X_eval = np.column_stack([
+            t_s**k for k in range(poly_deg + 1)
+        ])
+        return X_eval @ poly_coeffs
+
+    def full_model(t_eval):
+        t_eval = np.asarray(t_eval)
+        t_c = t_eval - t_mean
+        t_s = 2 * t_c / T
+        X_eval = np.column_stack([
+            *[t_s**k for k in range(poly_deg + 1)],
+            np.sin(omega_best * t_c),
+            np.cos(omega_best * t_c)
+        ])
+        return X_eval @ coeffs_full_best_freq
+
+    result = {
+        "name": name,
+        "best_frequency": best_frequency,
+        "best_period": 1 / best_frequency,
+        "period_lo": p_lo,
+        "period_hi": p_hi,
+        "best_amplitude": amplitude,
+        "mda": base["mda"],
+        "delta_chi2": best_delta_chi2,
+        "chi2_poly": base["chi2_poly"],
+        "chi2_red_initial": base["chi2_red_initial"],
+        "chi2_poly_initial": base["chi2_poly_initial"],
+        "chi2_red": base["chi2_red"],
+        "scale_factor_raw": base["scale_factor_raw"],
+        "scale_factor": base["scale_factor"],
+        "systematic_error": base["systematic_error"],
+        "dof": base["dof"],
+        "p_value_single_freq": p_value,
+        "poly_degree": poly_deg,
+        "time_baseline": T,
+        "resids": base["resids"],
+        "poly_model": poly_model,
+        "full_model": full_model,
+        "poly_coeffs": poly_coeffs,
+        "full_params": coeffs_full_best_freq,
+    }
+
+    return result
+
+
+def find_peak_ci_from_dchi2(freq, dchi2, conf=0.68, df=2):
+    """
+    Finds the confidence interval around the strongest peak
+    in Delta chi2 as a function of frequency.
+
+    Returns:
+        f_peak, f_lo, f_hi, level
+    """
+    freq = np.asarray(freq)
+    dchi2 = np.asarray(dchi2)
+
+    order = np.argsort(freq)
+    freq = freq[order]
+    dchi2 = dchi2[order]
+
+    i_peak = np.nanargmax(dchi2)
+
+    f_peak = freq[i_peak]
+    peak_val = dchi2[i_peak]
+
+    delta = chi2.ppf(conf, df=df)
+    level = peak_val - delta
+
+    # left intersection
+    f_lo = np.nan
+    for i in range(i_peak - 1, -1, -1):
+        if dchi2[i] <= level <= dchi2[i + 1]:
+
+            f_lo = np.interp(
+                level,
+                [dchi2[i], dchi2[i + 1]],
+                [freq[i], freq[i + 1]]
+            )
+            break
+
+    # right intersection
+    f_hi = np.nan
+    for i in range(i_peak, len(freq) - 1):
+        if dchi2[i] >= level >= dchi2[i + 1]:
+
+            f_hi = np.interp(
+                level,
+                [dchi2[i], dchi2[i + 1]],
+                [freq[i], freq[i + 1]]
+            )
+            break
+
+    return f_peak, f_lo, f_hi, level
