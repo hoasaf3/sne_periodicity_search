@@ -4,6 +4,12 @@ from pathlib import Path
 import numpy as np
 from numpy.linalg import lstsq
 from scipy.stats import chi2
+from scipy.stats import t as student_t
+
+import astropy.units as u
+from astropy.time import Time
+from astropy.coordinates import EarthLocation, AltAz, get_body
+from astroplan.moon import moon_illumination
 
 from lasair_tools import get_lightcurve_from_file
 
@@ -15,6 +21,23 @@ NYQUST_FACTOR = 5
 ZTF_FP_LIGHTCURVE_DIR = Path("ztf_fp_lightcurves")
 ZTF_FP_FILTER_TO_FID = {"ZTF_g": 1, "ZTF_r": 2, "ZTF_i": 3}
 MAG_ERROR_FACTOR = 2.5 / np.log(10)
+
+# Palomar Observatory (site of the ZTF camera on the Samuel Oschin telescope).
+PALOMAR = EarthLocation(lat=33.3564 * u.deg, lon=-116.8650 * u.deg, height=1713 * u.m)
+
+
+def get_moon_illumination_fraction(jd):
+    """Fraction of the Moon's disk illuminated (0=new, 1=full) at the given JD(s)."""
+    return moon_illumination(Time(np.atleast_1d(jd), format="jd"))
+
+
+def get_moon_altitude_deg(jd, location=PALOMAR):
+    """Moon's altitude in degrees above the horizon at the given JD(s) and site."""
+    time = Time(np.atleast_1d(jd), format="jd")
+    moon_altaz = get_body("moon", time, location=location).transform_to(
+        AltAz(obstime=time, location=location)
+    )
+    return moon_altaz.alt.deg
 
 
 def get_min_frequency(timespan):
