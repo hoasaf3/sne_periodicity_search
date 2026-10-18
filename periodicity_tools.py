@@ -4,6 +4,12 @@ from pathlib import Path
 import numpy as np
 from numpy.linalg import lstsq
 from scipy.stats import chi2
+from scipy.stats import t as student_t
+
+import astropy.units as u
+from astropy.time import Time
+from astropy.coordinates import EarthLocation, AltAz, get_body
+from astroplan.moon import moon_illumination
 
 from lasair_tools import get_lightcurve_from_file
 
@@ -15,6 +21,23 @@ NYQUST_FACTOR = 5
 ZTF_FP_LIGHTCURVE_DIR = Path("ztf_fp_lightcurves")
 ZTF_FP_FILTER_TO_FID = {"ZTF_g": 1, "ZTF_r": 2, "ZTF_i": 3}
 MAG_ERROR_FACTOR = 2.5 / np.log(10)
+
+# Palomar Observatory (site of the ZTF camera on the Samuel Oschin telescope).
+PALOMAR = EarthLocation(lat=33.3564 * u.deg, lon=-116.8650 * u.deg, height=1713 * u.m)
+
+
+def get_moon_illumination_fraction(jd):
+    """Fraction of the Moon's disk illuminated (0=new, 1=full) at the given JD(s)."""
+    return moon_illumination(Time(np.atleast_1d(jd), format="jd"))
+
+
+def get_moon_altitude_deg(jd, location=PALOMAR):
+    """Moon's altitude in degrees above the horizon at the given JD(s) and site."""
+    time = Time(np.atleast_1d(jd), format="jd")
+    moon_altaz = get_body("moon", time, location=location).transform_to(
+        AltAz(obstime=time, location=location)
+    )
+    return moon_altaz.alt.deg
 
 
 def get_min_frequency(timespan):
@@ -41,25 +64,23 @@ def get_decline_detections(name, epoch_after_peak=None):
     if name == '2019vsi':
         detections = [point for point in detections if point['jd'] - detections[0]['jd'] >= 40]
 
-
     # Find peak
     min_mag_idx = np.argmin([p['magpsf'] for p in detections])
     decline_detections = detections[min_mag_idx:]
     
     # Find gaps > 100 days and cut off the tail
     for i in range(1, len(decline_detections)):
-        previous_jd = decline_detections[i-1]['jd']
+        previous_jd = decline_detections[i - 1]['jd']
         current_jd = decline_detections[i]['jd']
-        
+
         if current_jd - previous_jd > MAX_GAP_JD:
-            # Gap found
             decline_detections = decline_detections[:i]
             break
-            
+
     if epoch_after_peak:
         max_jd = decline_detections[0]['jd'] + epoch_after_peak
         decline_detections = [p for p in decline_detections if p['jd'] <= max_jd]
-    
+
     return decline_detections
 
 
@@ -83,6 +104,7 @@ def _cut_to_decline(detections, name=None, epoch_after_peak=None):
     min_mag_idx = np.argmin([p["magpsf"] for p in detections])
     decline_detections = detections[min_mag_idx:]
 
+    # See the note in get_decline_detections() for why this gap cut is kept.
     for i in range(1, len(decline_detections)):
         previous_jd = decline_detections[i - 1]["jd"]
         current_jd = decline_detections[i]["jd"]
@@ -216,7 +238,7 @@ def get_decline_detections_fp(
     return _cut_to_decline(detections, name=name, epoch_after_peak=epoch_after_peak)
 
 
-def _prepare_baseline(days, mags, errors, poly_deg, systematic_error=0.0):
+def _prepare_baseline(days, mags, errors, poly_deg, systematic_error=0.015):
     """
     Fit a polynomial baseline and prepare all necessary vairables for the frequency search
     """
@@ -302,7 +324,7 @@ def compute_delta_chi2_curve(days, mags, errors,
                              poly_deg,
                              max_freq=MAX_FREQ,
                              nyquist_factor=NYQUST_FACTOR,
-                             systematic_error=0.0):
+                             systematic_error=0.015):
     """
     Calcualte the improvement in chi2 between baseline polynomial model and poly+sinusoid model.
     delta chi2 is chi2_poly - chi2_full, so bigger chi2 means better fit for full model.
@@ -352,7 +374,7 @@ def analyze_candidate(name, days, mags, errors,
                       poly_deg=3,
                       max_freq=MAX_FREQ,
                       nyquist_factor=NYQUST_FACTOR,
-                      systematic_error=0.0):
+                      systematic_error=0.015):
 
     base = _prepare_baseline(days, mags, errors, poly_deg, systematic_error=systematic_error)
     errors = base["normalized_errors"]
